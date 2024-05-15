@@ -1,0 +1,570 @@
+---
+title: "Demo of Bayesian Causal Forests on the 2018 ACIC Data Challenge"
+author: "Jared Murray, Drew Herren"
+date: "`r Sys.Date()`"
+bibliography: bcf_acic.bib
+output: 
+    html_document: default
+    pdf_document: default
+knit: |
+  (function(input, ...) {
+    rmarkdown::render(
+      input,
+      output_file = paste0(
+        xfun::sans_ext(input), '-', Sys.Date()
+      ),
+      output_dir = "output",
+      output_format = "html_document",
+      envir = globalenv()
+    )
+  })
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "../")
+```
+
+## Introduction
+
+The 2018 ACIC Data Challenge (@carvalho2019assessing) involved a semi-synthetic 
+observational dataset based on the National Study of Learning 
+Mindsets (@yeager2019national). This vignette shows how to analyze the 2018 
+ACIC data using BCF and related posterior summarization / diagnostic tools.
+
+First, we load requisite packages.
+
+```{r results='hide', message=FALSE, warning=FALSE}
+library(stochtree)
+library(xgboost)
+library(coda)
+library(possum)
+library(rpart)
+library(rpart.plot)
+library(partykit)
+library(here)
+```
+
+## Dataset
+
+Next, we import the synthetic NSLM data
+
+```{r}
+# Import dataset
+file_path <- file.path(here(), "data/acic2018/synthetic_data.csv")
+df <- read.csv(file_path)
+```
+
+Unpack the data into BCF components: outcome, treatment, random effects terms, 
+and covariates.
+
+```{r}
+# Outcome
+y <- df$Y
+
+# Treatment
+Z <- df$Z
+
+# Covariates
+covariate_df <- df[,!(colnames(df) %in% c("schoolid","Z","Y"))]
+unordered_categorical_cols <- c("C1","XC")
+ordered_categorical_cols <- c("S3","C2","C3")
+
+# Random effects terms
+group_ids <- as.integer(df$schoolid)
+rfx_basis <- cbind(1,Z)
+```
+
+## Model Run
+
+### Propensity model
+
+First, estimate the propensity score
+
+```{r}
+bart_model_propensity <- bart(X_train = covariate_df, y_train = as.numeric(Z), 
+                              num_gfr = 50, num_burnin = 0, num_mcmc = 0,
+                              unordered_cat_vars = unordered_categorical_cols, 
+                              ordered_cat_vars = ordered_categorical_cols)
+pi_train <- rowMeans(bart_model_propensity$y_hat_train)
+```
+
+### Outcome model
+
+Run a "multi-chain" variant of the BCF model, in which multiple MCMC samplers 
+are run from the results of different warm-start ensembles. 
+
+```{r}
+num_gfr <- 50
+num_burnin <- 50
+num_mcmc <- 200
+num_chains <- 10
+```
+
+
+We will coordinate the multiple models by serializing each model run to json 
+and restoring to R for prediction and analysis.
+
+**Note: you can comment out the loop below that samples the models if you are running this notebook multiple times on the same machine, since you will already have the json files from the previous model run serialized to disk.** The next cell below loads BCF models that have already been sampled from json files.
+
+```{r}
+t0 <- Sys.time()
+for (i in 1:num_chains) {
+    output_file <- file.path(here(), paste0("model_output/bcf_", i, ".json"))
+    bcf_model <- bcf(X_train = covariate_df, Z_train = Z, y_train = y,
+                     pi_train = pi_train, group_ids_train = group_ids,
+                     rfx_basis_train = rfx_basis, cutpoint_grid_size = 100,
+                     unordered_cat_vars = unordered_categorical_cols,
+                     ordered_cat_vars = ordered_categorical_cols,
+                     sample_sigma_leaf_tau = F, num_gfr = num_gfr,
+                     num_burnin = num_burnin, num_mcmc = num_mcmc)
+    saveBCFModelToJsonFile(bcf_model, output_file)
+}
+t1 <- Sys.time()
+t1 - t0
+```
+
+## Analysis
+
+### Deserialization
+
+Now, we deserialize each BCF model and unpack their predictions and other parameter samples. Note that this can take upwards of one minute to run, but is faster than re-running the multi-chain sampler from scratch on this dataset.
+
+```{r}
+num_rfx_params <- 2
+num_rfx_groups <- 76
+mcmc_indices <- (num_gfr+num_burnin+1):(num_gfr+num_burnin+num_mcmc)
+muhat_matrix <- matrix(NA, nrow = length(y), ncol = num_chains*num_mcmc)
+tauhat_matrix <- matrix(NA, nrow = length(y), ncol = num_chains*num_mcmc)
+yhat_matrix <- matrix(NA, nrow = length(y), ncol = num_chains*num_mcmc)
+rfx_matrix <- matrix(NA, nrow = length(y), ncol = num_chains*num_mcmc)
+sigma2_vector <- rep(NA, num_chains*num_mcmc)
+sigma_mu_vector <- rep(NA, num_chains*num_mcmc)
+chain_ind <- rep(NA, num_chains*num_mcmc)
+rfx_betas <- array(NA, dim = c(num_rfx_params,num_rfx_groups,num_chains*num_mcmc))
+rfx_alphas <- matrix(NA, nrow = num_rfx_params, ncol = num_chains*num_mcmc)
+
+for (i in 1:num_chains) {
+    inds <- 1:num_mcmc + (i-1)*num_mcmc
+    bcf_file <- file.path(here(), paste0("model_output/bcf_", i, ".json"))
+    bcf_model_restored <- createBCFModelFromJsonFile(bcf_file)
+    bcf_preds_reload <- predict(bcf_model_restored, covariate_df, Z,
+                                pi_train, group_ids, rfx_basis)
+    muhat_matrix[,inds] <- bcf_preds_reload$mu_hat
+    tauhat_matrix[,inds] <- bcf_preds_reload$tau_hat
+    yhat_matrix[,inds] <- bcf_preds_reload$y_hat
+    rfx_matrix[,inds] <- bcf_preds_reload$rfx_predictions
+    sigma2_vector[inds] <- bcf_model_restored$sigma2_samples
+    sigma_mu_vector[inds] <- bcf_model_restored$sigma_leaf_mu_samples
+    rfx_samples <- getRandomEffectSamples(bcf_model_restored)
+    rfx_betas[,,inds] <- rfx_samples$beta_samples[,,mcmc_indices]
+    rfx_alphas[,inds] <- rfx_samples$alpha_samples[,mcmc_indices]
+    chain_ind[inds] <- i
+}
+```
+
+Extract observation-level outputs of the model's mean components (i.e. $\mu(X)$ and $\tau(X)$ BART models and the random effects term).
+
+```{r}
+yhat_posterior <- yhat_matrix
+muhat_posterior <- muhat_matrix
+tauhat_posterior <- tauhat_matrix
+rfx_posterior <- rfx_matrix
+```
+
+### Predictive accuracy
+
+Compare the average predicted outcome from the BCF model versus actual outcomes.
+
+```{r}
+plot(rowMeans(yhat_posterior), y, xlab = "predicted", ylab = "actual", main = "Outcome")
+abline(0,1,col="red",lty=3,lwd=3)
+```
+
+### Random effects
+
+Inspect random school-level intercepts
+
+```{r}
+random_intercepts <- as.data.frame(rfx_betas[1,,])
+random_intercepts$schoolid <- 1:76
+random_intercepts_long <- reshape(random_intercepts, idvar = "schoolid",
+                                  varying = list(1:num_mcmc), v.names = "V", direction = "long")
+box_out <- boxplot(V ~ schoolid, data = random_intercepts_long, coef = 0, 
+                   xlab = "School ID", ylab = "Intercept", main = "Random Intercept Posterior")
+abline(h = 0, lty = 2, lwd = 3, col = "blue")
+```
+
+Let's look at that again but sort by median random intercept
+
+```{r, warning=FALSE}
+box_sort_inds <- order(box_out$stats[3,])
+box_out_sorted <- box_out
+box_out_sorted$stats <- box_out$stats[,box_sort_inds]
+box_out_sorted$n <- box_out$n[box_sort_inds]
+box_out_sorted$conf <- box_out$conf[,box_sort_inds]
+box_out_sorted$names <- box_out$names[box_sort_inds]
+box_out_sorted$out <- NULL
+bxp(box_out_sorted)
+abline(h = 0, lty = 2, lwd = 3, col = "blue")
+```
+
+Inspect random school-level regression coefficients on the treatment variable
+
+```{r}
+random_slopes <- as.data.frame(rfx_betas[2,,])
+random_slopes$schoolid <- 1:76
+random_slopes_long <- reshape(random_slopes, idvar = "schoolid", 
+                              varying = list(1:num_mcmc), v.names = "V", direction = "long")
+box_out <- boxplot(V ~ schoolid, data = random_slopes_long, coef = 0, 
+                   xlab = "School ID", ylab = "Slope", main = "Random Slope Posterior")
+abline(h = 0, lty = 2, lwd = 3, col = "blue")
+```
+
+Sorted by median random slope
+
+```{r, warning=FALSE}
+box_sort_inds <- order(box_out$stats[3,])
+box_out_sorted <- box_out
+box_out_sorted$stats <- box_out$stats[,box_sort_inds]
+box_out_sorted$n <- box_out$n[box_sort_inds]
+box_out_sorted$conf <- box_out$conf[,box_sort_inds]
+box_out_sorted$names <- box_out$names[box_sort_inds]
+box_out_sorted$out <- NULL
+bxp(box_out_sorted)
+abline(h = 0, lty = 2, lwd = 3, col = "blue")
+```
+
+### MCMC diagnostics
+
+We first assess the quality of our samplers by inspecting several of their outputs 
+under standard MCMC diagnostics, using the `coda` package. For this sampler, we 
+will unpack the time series of samples for several parameters:
+
+* Global variance ($\sigma^2$)
+* Leaf node scale ($\sigma_{\mu}$) for the prognostic forest
+* "Working parameter" ($\alpha$) used to sample school-level random effects under the @gelman2008using "redundant parameterization" sampling approach
+
+```{r}
+ate_posterior <- colMeans(tauhat_posterior)
+chain_mcmcs <- list()
+for (i in 1:10) {
+    chain_indices <- which(chain_ind == i)
+    sigma_global <- sigma2_vector[chain_indices]
+    sigma_leaf_mu <- sigma_mu_vector[chain_indices]
+    alpha_intercept <- rfx_alphas[1,chain_indices]
+    chain_mcmcs[[i]] <- mcmc(cbind(sigma_global, sigma_leaf_mu, alpha_intercept))
+}
+mcmc_list <- mcmc.list(chain_mcmcs)
+# mcmc_list
+```
+
+Summary metrics, density plots, and traceplots
+
+```{r}
+summary(mcmc_list)
+plot(mcmc_list)
+acfplot(mcmc_list)
+effectiveSize(mcmc_list)
+```
+
+Gelman-Rubin multi-chain convergence diagnostics
+
+```{r}
+gelman.diag(mcmc_list)
+```
+
+Average autocorrelation across all of the chains
+
+```{r}
+autocorr.diag(mcmc_list)
+```
+
+Cross-correlation of parameters
+
+```{r}
+crosscorr(mcmc_list)
+```
+
+Heidelberger and Welch's convergence diagnostic
+
+```{r}
+heidel.diag(mcmc_list)
+```
+
+### Average treatment effects
+
+Look at the posterior of the ATE
+
+```{r}
+ate_dist <- colMeans(tauhat_posterior)
+hist(ate_dist, xlab = "ATE", ylab = "Density", main = "Average Treatment Effect", freq = F)
+ate <- mean(ate_dist)
+ate_lb <- quantile(ate_dist, 0.025)
+ate_ub <- quantile(ate_dist, 0.975)
+abline(v = ate, lty = 3, lwd = 3, col = "black")
+abline(v = ate_lb, lty = 3, lwd = 3, col = "blue")
+abline(v = ate_ub, lty = 3, lwd = 3, col = "blue")
+```
+
+Look at the posterior of the ATT
+
+```{r}
+att_dist <- colMeans(tauhat_posterior[Z==1,])
+hist(ate_dist, xlab = "ATT", ylab = "Density", main = "Average Treatment Effect on the Treated", freq = F)
+att <- mean(att_dist)
+att_lb <- quantile(att_dist, 0.025)
+att_ub <- quantile(att_dist, 0.975)
+abline(v = att, lty = 3, lwd = 3, col = "black")
+abline(v = att_lb, lty = 3, lwd = 3, col = "blue")
+abline(v = att_ub, lty = 3, lwd = 3, col = "blue")
+```
+
+### Marginal effects of each covariate on $\tau(X)$
+
+One way to understand the nonparametric $\tau(X)$ model is by fitting an interpretable summary model to its predictions. 
+Our first such "posterior summarization" approach will be a generalized additive model (GAM), which is accessible through the `additive_summary` and `additive_summary_plot` functions in `possum`.
+
+```{r, warning=FALSE, message=FALSE, results='hide', fig.keep='all'}
+model_df <- covariate_df
+model_df$tauhat <- rowMeans(tauhat_posterior)
+ff = tauhat ~ s(X1) + s(X2) + s(X3) + s(X4) + s(X5) + factor(C1)+ 
+    factor(S3) + factor(C2) + factor(C3) + factor(XC)
+gf = additive_summary(ff, tauhat_posterior, df=model_df, fast=TRUE)
+additive_summary_plot(gf, windsor = 0.02)
+```
+
+Since the additive GAM summary is a surrogate, we can inspect its fit relative 
+to the "full" model by looking at the surrogate's $R^2$.
+
+```{r}
+hist(gf$summaryRsq, main = "", xlab = "Summary R-sq")
+```
+
+### Marginal effects of select covariates on $\tau(X)$
+
+We can also use mgcv / possum to define a simple generalized additive model (GAM) that 
+only considers certain variables. Here, we consider $X1$, $X2$, and $C1$.
+
+```{r, warning=FALSE, message=FALSE, results='hide', fig.keep='all'}
+model_df <- covariate_df
+model_df$tauhat <- rowMeans(tauhat_posterior)
+ff = tauhat ~ s(X1) + s(X2) + factor(C1)
+gf = additive_summary(ff, tauhat_posterior, df=model_df, fast=TRUE)
+additive_summary_plot(gf, windsor = 0.02)
+```
+
+### Analysis of pre-determined subgroups
+
+The analysis we've seen thus far has tried to analyze and summarize the entire CATE function at every value of $X$. 
+Another thing we can do is aggregate CATEs into groups and compare subgroup average treatment effects. Aggregating into subgroups is not just a mechanism for gaining precision, but an effective way to summarize and communicate the posterior distribution in its own right.
+
+Since the above plots indicate more heterogeneity in $X1$ and $X2$, one straightforward 
+thing we can do is to compare the posterior distributions for observations above / below the median for each of these variables.
+
+#### $X1 \leq \mathrm{median}(X1)$ versus $X1 > \mathrm{median}(X1)$
+
+First we look at side-by-side histograms of the average subgroup treatment 
+effect posterior for below-median and above-median values of $X1$.
+
+```{r}
+var_med <- median(covariate_df$X1)
+lo <- covariate_df$X1 <= var_med
+hi <- covariate_df$X1 > var_med
+
+loTaus <- tauhat_posterior[lo,]
+hiTaus <- tauhat_posterior[hi,]
+
+wloTaus <- colMeans(loTaus)
+whiTaus <- colMeans(hiTaus)
+
+groupTaus <- data.frame(taus     = c(wloTaus, whiTaus),
+                        Subgroup = c(rep("Low X1", length(wloTaus)), 
+                                     rep("High X1", length(whiTaus))))
+
+ggplot(groupTaus, aes(taus, fill = Subgroup, color = Subgroup)) +
+  geom_density(alpha = 0.5) +
+  ylab("Posterior density") +
+  xlab("Average subgroup treatment effect")
+```
+
+We can also look at the histogram of their difference.
+
+```{r}
+qplot(whiTaus-wloTaus, geom="density", 
+      main="Posterior distribution of difference\n between subgroup ATEs", 
+      xlim=c(-0.2, 0.1), xlab="Difference") + 
+    geom_vline(xintercept=0, linetype=2)
+```
+
+The effect "jumps" out less in the GAM plot, but here we see reasonably strong 
+evidence that $\tau(X)$ is decreasing in $X1$.
+
+#### $X2 \leq \mathrm{median}(X2)$ versus $X2 > \mathrm{median}(X2)$
+
+We repeat this same analysis for variable $X2$.
+
+First, we look at side-by-side histograms of the average subgroup treatment 
+effect posterior for below-median and above-median values of $X2$.
+
+```{r}
+var_med <- median(covariate_df$X2)
+lo <- covariate_df$X2 <= var_med
+hi <- covariate_df$X2 > var_med
+
+loTaus <- tauhat_posterior[lo,]
+hiTaus <- tauhat_posterior[hi,]
+
+wloTaus <- colMeans(loTaus)
+whiTaus <- colMeans(hiTaus)
+
+groupTaus <- data.frame(taus     = c(wloTaus, whiTaus),
+                        Subgroup = c(rep("Low X2", length(wloTaus)), 
+                                     rep("High X2", length(whiTaus))))
+
+ggplot(groupTaus, aes(taus, fill = Subgroup, color = Subgroup)) +
+  geom_density(alpha = 0.5) +
+  ylab("Posterior density") +
+  xlab("Average subgroup treatment effect")
+```
+
+Then we look at the histogram of their difference.
+
+```{r}
+qplot(whiTaus-wloTaus, geom="density", 
+      main="Posterior distribution of difference\n between subgroup ATEs", 
+      xlim=c(-0.05, 0.15), xlab="Difference") + 
+    geom_vline(xintercept=0, linetype=2)
+```
+
+And here we see reasonably strong evidence that $\tau(X)$ is increasing in $X2$.
+
+### Subgroup identification
+
+To help summarize the posterior @hahn2020bayesian recommend fitting a CART model where the response variable is $\hat{\tau}(X)$ and the predictor variables are the covariates used to fit the BCF model. 
+This is an attempt to find the Bayes estimate of subgroups represented by a recursive partition (under squared error loss on $\tau$ with complexity constraints/penalties); it is only an attempt to find the Bayes estimate because of the greedy nature of the CART algorithm.
+
+The complexity constraints or penalties on the tree are up to the user, but there is no particular reason to adopt `rpart`'s default complexity penalty.  If the goal is subgroup identification a reasonable way to proceed is to grow the trees up to some depth that gives credible (i.e. relatively simple) definitions of subgroups and prune back based on the size of the difference in estimated subgroup effects across end nodes, or posterior probabilities of a meaningful difference, or other application-specific criteria.
+
+```{r}
+# Setup a dataframe with categorical data represented as factors
+model_df <- covariate_df
+model_df$outcome <- rowMeans(tauhat_posterior)
+model_df$S3 <- factor(model_df$S3, ordered = T)
+model_df$C2 <- factor(model_df$C2, ordered = T)
+model_df$C3 <- factor(model_df$C3, ordered = T)
+model_df$C1 <- factor(model_df$C1, ordered = F)
+model_df$XC <- factor(model_df$XC, ordered = F)
+tree_form <- outcome ~ S3 + C1 + C2 + C3 + XC + X1 + X2 + X3 + X4 + X5
+tree <- rpart(tree_form, data=model_df, control=rpart.control(maxdepth=3, cp=-1))
+rpart.plot(tree)
+```
+
+Let's look at the breakdown of splits in this tree per variable.
+
+```{r}
+knitr::kable(table(tree$frame$var[tree$frame$var!="<leaf>"]), 
+             col.names = c("Variable", "Number of Splits"))
+```
+
+We forced the tree above to be the maximal depth 3 tree by specifying `cp=-1`. Now we consider pruning the tree, which is easiest using the partykit package.
+
+```{r}
+ptree = as.party(tree)
+print(ptree)
+```
+
+We can start by getting the posterior distributions for the subgroup ATEs defined by the terminal nodes of the tree, and then looking at the differences between subgroups defined by the last splits of the tree:
+
+```{r}
+# Get terminal node for each observation
+subgp = predict(ptree, type='node')
+
+# Get posteriors for subgroup ATEs
+subgp_id = sort(unique(subgp))
+get_sub_post = function(ix, taupost) {
+  subtaus = taupost[ix,]
+  colMeans(subtaus)
+}
+subgp_post = lapply(subgp_id, function(x) get_sub_post(subgp==x, tauhat_posterior))
+names(subgp_post) = subgp_id
+
+# Plot the difference in subgroup effects between adjacent 
+# terminal nodes in the tree above
+plot(density(subgp_post[['4']] - subgp_post[['5']]), main="4 vs 5")
+abline(v=0, lty=2)
+```
+
+```{r}
+plot(density(subgp_post[['7']] - subgp_post[['8']]), main="7 vs 8")
+abline(v=0, lty=2)
+```
+
+```{r}
+plot(density(subgp_post[['11']] - subgp_post[['12']]), main="11 vs 12")
+abline(v=0, lty=2)
+```
+
+```{r}
+plot(density(subgp_post[['14']] - subgp_post[['15']]), main="14 vs 15")
+abline(v=0, lty=2)
+```
+
+If we decide we want a simpler summary with coarser subgroups, we can prune certain splits away and re-examine.
+
+```{r}
+pruned_ptree = nodeprune(ptree, c(6,13))
+subgp = predict(pruned_ptree, type='node')
+subgp_id = sort(unique(subgp))
+subgp_post = lapply(subgp_id, function(x) get_sub_post(subgp==x, tauhat_posterior))
+names(subgp_post) = subgp_id
+
+# Note that the node indices here are different than in the code block above
+plot(density(subgp_post[['4']] - subgp_post[['5']]), main="4 vs 5")
+abline(v=0, lty=2)
+```
+
+```{r}
+plot(density(subgp_post[['9']] - subgp_post[['10']]), main="9 vs 10")
+abline(v=0, lty=2)
+```
+
+```{r}
+plot(density(subgp_post[['6']] - subgp_post[['11']]), main="6 vs 11")
+abline(v=0, lty=2)
+```
+
+We can make other comparisons too, like contrasting the subgroup with the largest CATE with its complement:
+
+```{r}
+subgp_means <- sapply(subgp_post, mean)
+subgp_names <- names(subgp_means)
+largest_subgp_id <- as.integer(subgp_names[which.max(subgp_means)])
+largest = subgp==largest_subgp_id
+post_largest = get_sub_post(largest, tauhat_posterior)
+post_others  = get_sub_post(!largest, tauhat_posterior)
+plot(density(post_largest), xlim=c(0,1.2), ylim=c(0,9), main = "Largest CATE subgroup \n vs others")
+lines(density(post_others), lty=2)
+```
+
+```{r}
+plot(density(post_largest - post_others), main = "Difference between largest\n CATE subgroup & others")
+```
+
+Note that there are other ways to think about summarizing the posterior with a tree (e.g. using the tree as a generic function approximation tool rather than a subgroup-finder, in which case we might prefer deeper trees). We will explore these in future vignettes / documentation for the `stochtree` package.
+
+### Covariate analysis
+
+How correlated are the numeric variables?
+
+```{r}
+pairs(covariate_df[,c("X1","X2","X3","X4","X5")])
+```
+
+Let's zoom in on $X_1$ and $X_2$
+
+```{r}
+pairs(covariate_df[,c("X1","X2")])
+```
+
+## References

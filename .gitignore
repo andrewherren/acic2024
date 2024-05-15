@@ -47,3 +47,10 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+
+# JSON and other output files
+*.json
+*.csv
+*.png
+*.pdf
+*.html
